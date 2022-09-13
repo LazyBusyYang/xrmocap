@@ -53,6 +53,7 @@ jobs:
           source /root/miniconda3/etc/profile.d/conda.sh && conda activate openxrlab
           pip install pytest-github-actions-annotate-failures
       - name: Run unittests and generate coverage report
+        continue-on-error: false
         run: |
           source /root/miniconda3/etc/profile.d/conda.sh && conda activate openxrlab
           coverage run --source xrmocap -m pytest tests/
