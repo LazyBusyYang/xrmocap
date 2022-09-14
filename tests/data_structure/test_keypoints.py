@@ -67,8 +67,6 @@ def test_set_keypoints():
     kps_np = np.zeros(shape=(2, 3, 144, 3))
     keypoints.set_keypoints(kps_np)
     assert keypoints.get_frame_number() == 2
-    # remove assert keypoints.get_frame_number() == 3 in PR
-    assert keypoints.get_frame_number() == 3
     # set torch
     keypoints.set_keypoints(torch.from_numpy(kps_np))
     assert keypoints.get_frame_number() == 2
