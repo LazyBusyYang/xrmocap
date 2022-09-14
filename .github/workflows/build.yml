@@ -56,7 +56,7 @@ jobs:
         continue-on-error: false
         run: |
           source /root/miniconda3/etc/profile.d/conda.sh && conda activate openxrlab
-          pytest tests/
+          coverage run --source xrmocap -m pytest tests/
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
