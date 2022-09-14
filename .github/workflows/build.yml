@@ -52,11 +52,15 @@ jobs:
         run: |
           source /root/miniconda3/etc/profile.d/conda.sh && conda activate openxrlab
           pip install pytest-github-actions-annotate-failures
-      - name: Run unittests and generate coverage report
-        continue-on-error: false
+      - name: Run unittests
         run: |
           source /root/miniconda3/etc/profile.d/conda.sh && conda activate openxrlab
           coverage run --source xrmocap -m pytest tests/
+      - name: Generate coverage report
+        run: |
+          source /root/miniconda3/etc/profile.d/conda.sh && conda activate openxrlab
+          coverage xml
+          coverage report -m
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
