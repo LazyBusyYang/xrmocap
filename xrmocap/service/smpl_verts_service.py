@@ -53,6 +53,7 @@ class SMPLVertsService(BaseFlaskService):
                  device: Union[torch.device, str] = 'cuda',
                  host: str = '0.0.0.0',
                  port: int = 29091,
+                 max_http_buffer_size: int = 128 * 1024 * 1024,
                  logger: Union[None, str, logging.Logger] = None) -> None:
         """
         Args:
@@ -105,7 +106,8 @@ class SMPLVertsService(BaseFlaskService):
         self.app.config['SECRET_KEY'] = os.urandom(24) \
             if secret_key is None \
             else secret_key
-        self.socketio = SocketIO(self.app)
+        # max_http_buffer_size: the maximum allowed payload
+        self.socketio = SocketIO(self.app, max_http_buffer_size=max_http_buffer_size)
         self.device = device
         self.worker_lock = RLock()
         # set body model configs for all types and genders
@@ -118,14 +120,8 @@ class SMPLVertsService(BaseFlaskService):
             self.logger.warning('enable_gzip is set to True,' +
                                 ' but enable_bytes is set to False. '
                                 'enable_gzip will be ignored.')
-        self.socketio.on_event(
-            message='upload',
-            handler=self.upload_smpl_data,
-        )
-        self.socketio.on_event(
-            message='forward',
-            handler=self.forward_body_model,
-        )
+        
+        self.call_backs()
         self.socketio.on_event(
             message='disconnect',
             handler=self.on_disconnect,
@@ -168,122 +164,156 @@ class SMPLVertsService(BaseFlaskService):
         self._clean_files_by_uuid(uuid_str)
         session.clear()
 
-    def upload_smpl_data(self, data: dict) -> dict:
-        """Upload smpl data file, check whether the corresponding body model
-        config exists, and save it to work_dir if success.
+    def call_backs(self):
+        @self.socketio.on('upload')
+        def upload_smpl_data(data: dict) -> dict:
+            """Upload smpl data file, check whether the corresponding body model
+            config exists, and save it to work_dir if success.
 
-        Args:
-            data (dict): smpl data file info, including
-                file_name and file_data.
+            Args:
+                data (dict): smpl data file info, including
+                    file_name and file_data.
 
-        Returns:
-            dict: response info, including status, and
-                msg when fails.
-        """
-        resp_dict = dict()
-        uuid_str = session['uuid']
-        smpl_data_in_session = session.get('smpl_data', None)
-        if smpl_data_in_session is not None:
-            warn_msg = f'Client {uuid_str} has already uploaded a file.' +\
-                ' Overwriting.'
-            self.logger.warning(warn_msg)
-            resp_dict['msg'] = f'Warning: {warn_msg}'
-        file_name = data['file_name']
-        file_data = data['file_data']
-        file_path = os.path.join(self.work_dir, f'{uuid_str}_{file_name}.npz')
-        with open(file_path, 'wb') as file:
-            file.write(file_data)
-        # load smpl data
-        smpl_data, class_name = auto_load_smpl_data(
-            npz_path=file_path, logger=self.logger)
-        smpl_type = class_name.replace('Data', '').lower()
-        smpl_gender = smpl_data.get_gender()
-        # check if the body model files exist
-        if smpl_type not in self.body_model_configs or\
-                smpl_gender not in self.body_model_configs[smpl_type]:
-            error_msg = f'Client {uuid_str} has smpl type {smpl_type} ' +\
-                f'and smpl gender {smpl_gender}, ' +\
-                'but no corresponding body model config found.'
-            resp_dict['msg'] = f'Error: {warn_msg}'
-            self.logger.error(error_msg)
-            emit('upload_response', resp_dict)
-        # build body model
-        body_model_cfg = self.body_model_configs[smpl_type][smpl_gender]
-        body_model = build_body_model(body_model_cfg).to(self.device)
-        # save body model to cache
-        session['smpl_type'] = smpl_type.replace('Data', '').lower()
-        session['smpl_gender'] = smpl_data.get_gender()
-        session['smpl_data'] = smpl_data
-        session['body_model'] = body_model
-        session['last_connect_time'] = time.time()
-        self.logger.info(
-            f'Client {uuid_str} smpl data file loaded confirmed.\n' +
-            f'Body model type: {smpl_type}\n' + f'Gender: {smpl_gender}')
-        resp_dict['status'] = 'success'
-        emit('upload_response', resp_dict)
-        return resp_dict
-
-    def forward_body_model(self, data: dict) -> dict:
-        """Call body_model.forward() to get SMPL vertices.
-
-        Args:
-            data (dict): Request data, frame_idx is required.
-
-        Returns:
-            dict: Response data.
-                If success, status is 'success' and
-                vertices bytes for an ndarray.
-        """
-        resp_dict = dict()
-        req_dict = data
-        uuid_str = session['uuid']
-        frame_idx = req_dict['frame_idx']
-        smpl_data = session['smpl_data']
-        # check if data and args are valid
-        failed = False
-        if smpl_data is None:
-            error_msg = f'Client {uuid_str}\'s smpl data not uploaded.'
-            failed = True
-        elif frame_idx >= smpl_data.get_batch_size():
-            error_msg = f'Client {uuid_str}\'s smpl data only has ' +\
-                f'{smpl_data.get_batch_size()} frames, ' +\
-                f'but got frame_idx={frame_idx} in request.'
-            failed = True
-        if failed:
-            self.logger.error(error_msg)
-            resp_dict['msg'] = f'Error: {error_msg}'
-            resp_dict['status'] = 'fail'
-            emit('forward_response', resp_dict)
-        # no error, forward body model
-        else:
-            tensor_dict = smpl_data.to_tensor_dict(
-                repeat_betas=True, device=self.device)
-            for k, v in tensor_dict.items():
-                tensor_dict[k] = v[frame_idx:frame_idx + 1]
-            body_model = session['body_model']
-            with self.worker_lock:
-                self.forward_timer.start()
-                with torch.no_grad():
-                    body_model_output = body_model(**tensor_dict)
-                self.forward_timer.stop()
-                if self.forward_timer.count >= 50:
-                    self.logger.info(
-                        'Average forward time per-frame:' +
-                        f' {self.forward_timer.get_average(reset=True):.4f} s')
-            verts = body_model_output['vertices']  # n_batch=1, n_verts, 3
-            verts_np = verts.cpu().numpy().squeeze(0).astype(np.float16)
+            Returns:
+                dict: response info, including status, and
+                    msg when fails.
+            """
+            
+            resp_dict = dict()
+            uuid_str = session['uuid']
+            smpl_data_in_session = session.get('smpl_data', None)
+            if smpl_data_in_session is not None:
+                warn_msg = f'Client {uuid_str} has already uploaded a file.' +\
+                    ' Overwriting.'
+                self.logger.warning(warn_msg)
+                resp_dict['msg'] = f'Warning: {warn_msg}'
+            file_name = data['file_name']
+            file_data = data['file_data']
+            file_path = os.path.join(self.work_dir, f'{uuid_str}_{file_name}.npz')
+            with open(file_path, 'wb') as file:
+                file.write(file_data)
+            # load smpl data
+            smpl_data, class_name = auto_load_smpl_data(
+                npz_path=file_path, logger=self.logger)
+            smpl_type = class_name.replace('Data', '').lower()
+            smpl_gender = smpl_data.get_gender()
+            # check if the body model files exist
+            if smpl_type not in self.body_model_configs or\
+                    smpl_gender not in self.body_model_configs[smpl_type]:
+                error_msg = f'Client {uuid_str} has smpl type {smpl_type} ' +\
+                    f'and smpl gender {smpl_gender}, ' +\
+                    'but no corresponding body model config found.'
+                resp_dict['msg'] = f'Error: {warn_msg}'
+                self.logger.error(error_msg)
+                emit('upload_response', resp_dict)
+            # build body model
+            body_model_cfg = self.body_model_configs[smpl_type][smpl_gender]
+            body_model = build_body_model(body_model_cfg).to(self.device)
+            # save body model to cache
+            session['smpl_type'] = smpl_type.replace('Data', '').lower()
+            session['smpl_gender'] = smpl_data.get_gender()
+            session['smpl_data'] = smpl_data
+            session['body_model'] = body_model
+            session['faces'] = body_model.faces
             session['last_connect_time'] = time.time()
-            if self.enable_bytes:
-                verts_bytes = verts_np.tobytes()
-                if self.enable_gzip:
-                    verts_bytes = gzip.compress(verts_bytes)
-                emit('forward_response', verts_bytes)
-            else:
-                resp_dict['verts'] = verts_np.tolist()
-                resp_dict['status'] = 'success'
-                emit('forward_response', resp_dict)
-        return resp_dict
+            self.logger.info(
+                f'Client {uuid_str} smpl data file loaded confirmed.\n' +
+                f'Body model type: {smpl_type}\n' + f'Gender: {smpl_gender}')
+            resp_dict['num_frames'] = smpl_data.get_batch_size()
+            resp_dict['status'] = 'success'
+            
+            return resp_dict
+        
+        @self.socketio.on('forward')
+        def forward_body_model(data: dict) -> dict:
+            """Call body_model.forward() to get SMPL vertices.
 
+            Args:
+                data (dict): Request data, frame_idx is required.
+
+            Returns:
+                dict: Response data.
+                    If success, status is 'success' and
+                    vertices bytes for an ndarray.
+            """
+            resp_dict = dict()
+            req_dict = data
+            uuid_str = session['uuid']
+            frame_idx = req_dict['frame_idx']
+            smpl_data = session['smpl_data']
+            # check if data and args are valid
+            failed = False
+            if smpl_data is None:
+                error_msg = f'Client {uuid_str}\'s smpl data not uploaded.'
+                failed = True
+            elif frame_idx >= smpl_data.get_batch_size():
+                error_msg = f'Client {uuid_str}\'s smpl data only has ' +\
+                    f'{smpl_data.get_batch_size()} frames, ' +\
+                    f'but got frame_idx={frame_idx} in request.'
+                failed = True
+            if failed:
+                self.logger.error(error_msg)
+                resp_dict['msg'] = f'Error: {error_msg}'
+                resp_dict['status'] = 'fail'
+                return resp_dict
+            # no error, forward body model
+            else:
+                tensor_dict = smpl_data.to_tensor_dict(
+                    repeat_betas=True, device=self.device)
+                for k, v in tensor_dict.items():
+                    tensor_dict[k] = v[frame_idx:frame_idx + 1]
+                body_model = session['body_model']
+                with self.worker_lock:
+                    self.forward_timer.start()
+                    with torch.no_grad():
+                        body_model_output = body_model(**tensor_dict)
+                    self.forward_timer.stop()
+                    if self.forward_timer.count >= 50:
+                        self.logger.info(
+                            'Average forward time per-frame:' +
+                            f' {self.forward_timer.get_average(reset=True):.4f} s')
+                verts = body_model_output['vertices']  # n_batch=1, n_verts, 3
+                verts_np = verts.cpu().numpy().squeeze(0).astype(np.float16)
+                session['last_connect_time'] = time.time()
+                if self.enable_bytes:
+                    verts_bytes = verts_np.tobytes()
+                    if self.enable_gzip:
+                        verts_bytes = gzip.compress(verts_bytes)
+                    return verts_bytes
+                else:
+                    resp_dict['verts'] = verts_np.tolist()
+                    resp_dict['status'] = 'success'
+                    return resp_dict
+        
+        @self.socketio.on('get_faces')
+        def get_faces() -> dict:
+            resp_dict = dict()
+            faces = session['faces']
+            # check if data and args are valid
+            success = True
+            if faces is None:
+                error_msg = f'Failed to get body faces.'
+                success = False
+
+            if success is False:
+                self.logger.error(error_msg)
+                resp_dict['msg'] = f'Error: {error_msg}'
+                resp_dict['status'] = 'fail'
+
+                return resp_dict
+
+            session['last_connect_time'] = time.time()
+
+            if self.enable_bytes:
+                faces = np.array(faces, dtype=np.int32)
+                faces_bytes = faces.tobytes()
+
+                return faces_bytes
+            else:
+                resp_dict['faces'] = faces
+                resp_dict['status'] = 'success'
+                return resp_dict
+            
     def _clean_files_by_uuid(self, uuid: str) -> None:
         file_names = os.listdir(self.work_dir)
         for file_name in file_names:
